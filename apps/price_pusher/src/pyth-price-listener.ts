@@ -1,15 +1,15 @@
 import {
   HexString,
-  PriceFeed,
-  PriceServiceConnection,
-} from "@pythnetwork/price-service-client";
+  HermesClient,
+  PriceUpdate,
+} from "@pythnetwork/hermes-client";
 import { PriceInfo, IPriceListener, PriceItem } from "./interface";
 import { Logger } from "pino";
 
 type TimestampInMs = number & { readonly _: unique symbol };
 
 export class PythPriceListener implements IPriceListener {
-  private connection: PriceServiceConnection;
+  private hermesClient: HermesClient;
   private priceIds: HexString[];
   private priceIdToAlias: Map<HexString, string>;
   private latestPriceInfo: Map<HexString, PriceInfo>;
@@ -18,11 +18,11 @@ export class PythPriceListener implements IPriceListener {
   private healthCheckInterval?: NodeJS.Timeout;
 
   constructor(
-    connection: PriceServiceConnection,
+    hermesClient: HermesClient,
     priceItems: PriceItem[],
     logger: Logger
   ) {
-    this.connection = connection;
+    this.hermesClient = hermesClient;
     this.priceIds = priceItems.map((priceItem) => priceItem.id);
     this.priceIdToAlias = new Map(
       priceItems.map((priceItem) => [priceItem.id, priceItem.alias])
@@ -34,108 +34,101 @@ export class PythPriceListener implements IPriceListener {
   // This method should be awaited on and once it finishes it has the latest value
   // for the given price feeds (if they exist).
   async start() {
-    // Set custom error handler for websocket errors
-    this.connection.onWsError = (error: Error) => {
-      if (error.message.includes("not found")) {
-        // Extract invalid feed IDs from error message
-        const match = error.message.match(/\[(.*?)\]/);
-        if (match) {
-          const invalidFeedIds = match[1].split(",").map((id) => {
-            // Remove '0x' prefix if present to match our stored IDs
-            return id.trim().replace(/^0x/, "");
-          });
+    const priceMetadata = await this.hermesClient.getPriceFeeds();
+    const allPriceIds = priceMetadata.map((priceMetadata) => priceMetadata.id);
 
-          // Log invalid feeds with their aliases
-          invalidFeedIds.forEach((id) => {
-            this.logger.error(
-              `Price feed ${id} (${this.priceIdToAlias.get(
-                id
-              )}) not found for subscribePriceFeedUpdates`
-            );
-          });
-
-          // Filter out invalid feeds and resubscribe with valid ones
-          const validFeeds = this.priceIds.filter(
-            (id) => !invalidFeedIds.includes(id)
-          );
-
-          this.priceIds = validFeeds;
-
-          if (validFeeds.length > 0) {
-            this.logger.info("Resubscribing with valid feeds only");
-            this.connection.subscribePriceFeedUpdates(
-              validFeeds,
-              this.onNewPriceFeed.bind(this)
-            );
-          }
+    // Filter out invalid price ids
+    const { existingPriceIds, invalidPriceIds } = this.priceIds.reduce<{
+      existingPriceIds: string[];
+      invalidPriceIds: string[];
+    }>(
+      (acc, id) => {
+        if (allPriceIds.includes(id)) {
+          acc.existingPriceIds.push(id);
+        } else {
+          acc.invalidPriceIds.push(id);
         }
-      } else {
-        this.logger.error("Websocket error occurred:", error);
-      }
-    };
-
-    this.connection.subscribePriceFeedUpdates(
-      this.priceIds,
-      this.onNewPriceFeed.bind(this)
+        return acc;
+      },
+      { existingPriceIds: [], invalidPriceIds: [] }
     );
 
-    try {
-      const priceFeeds = await this.connection.getLatestPriceFeeds(
-        this.priceIds
-      );
-      priceFeeds?.forEach((priceFeed) => {
-        const latestAvailablePrice = priceFeed.getPriceUnchecked();
-        this.latestPriceInfo.set(priceFeed.id, {
-          price: latestAvailablePrice.price,
-          conf: latestAvailablePrice.conf,
-          publishTime: latestAvailablePrice.publishTime,
-        });
-      });
-    } catch (error: any) {
-      // Always log the HTTP error first
-      this.logger.error("Failed to get latest price feeds:", error);
+    const invalidPriceIdsWithAlias = invalidPriceIds.map((id) =>
+      this.priceIdToAlias.get(id)
+    );
+    this.logger.error(
+      `Invalid price id submitted for: ${invalidPriceIdsWithAlias.join(", ")}`
+    );
 
-      if (error.response.data.includes("Price ids not found:")) {
-        // Extract invalid feed IDs from error message
-        const invalidFeedIds = error.response.data
-          .split("Price ids not found:")[1]
-          .split(",")
-          .map((id: string) => id.trim().replace(/^0x/, ""));
+    this.priceIds = existingPriceIds;
+    // TODO: We can just remove the invalid price ids from the map
+    this.priceIdToAlias = new Map(
+      existingPriceIds.map(
+        (id) => [id, this.priceIdToAlias.get(id)] as [HexString, string]
+      )
+    );
 
-        // Log invalid feeds with their aliases
-        invalidFeedIds.forEach((id: string) => {
-          this.logger.error(
-            `Price feed ${id} (${this.priceIdToAlias.get(
-              id
-            )}) not found for getLatestPriceFeeds`
-          );
-        });
-
-        // Filter out invalid feeds and retry
-        const validFeeds = this.priceIds.filter(
-          (id) => !invalidFeedIds.includes(id)
+    const eventSource = await this.hermesClient.getPriceUpdatesStream(
+      this.priceIds,
+      {
+        parsed: true,
+        ignoreInvalidPriceIds: true,
+      }
+    );
+    eventSource.onmessage = (event: MessageEvent<string>) => {
+      const priceUpdates = JSON.parse(event.data) as PriceUpdate;
+      priceUpdates.parsed?.forEach((priceUpdate) => {
+        this.logger.debug(
+          `Received new price feed update from Pyth price service: ${this.priceIdToAlias.get(
+            priceUpdate.id
+          )} ${priceUpdate.id}`
         );
 
-        this.priceIds = validFeeds;
-
-        if (validFeeds.length > 0) {
-          this.logger.info(
-            "Retrying getLatestPriceFeeds with valid feeds only"
-          );
-          const validPriceFeeds = await this.connection.getLatestPriceFeeds(
-            validFeeds
-          );
-          validPriceFeeds?.forEach((priceFeed) => {
-            const latestAvailablePrice = priceFeed.getPriceUnchecked();
-            this.latestPriceInfo.set(priceFeed.id, {
-              price: latestAvailablePrice.price,
-              conf: latestAvailablePrice.conf,
-              publishTime: latestAvailablePrice.publishTime,
-            });
-          });
+        // Consider price to be currently available if it is not older than 60s
+        const currentPrice =
+          Date.now() / 1000 - priceUpdate.price.publish_time > 60
+            ? undefined
+            : priceUpdate.price;
+        if (currentPrice === undefined) {
+          return;
         }
-      }
-    }
+
+        const priceInfo: PriceInfo = {
+          conf: currentPrice.conf,
+          price: currentPrice.price,
+          publishTime: currentPrice.publish_time,
+        };
+
+        this.latestPriceInfo.set(priceUpdate.id, priceInfo);
+        this.lastUpdated = Date.now() as TimestampInMs;
+      });
+    };
+
+    eventSource.onerror = (error: Event) => {
+      console.error("Error receiving updates from Hermes:", error);
+      eventSource.close();
+    };
+
+    // try {
+    //   const priceUpdates = await this.hermesClient.getLatestPriceUpdates(
+    //     this.priceIds,
+    //     {
+    //       encoding: "hex",
+    //       parsed: true,
+    //       ignoreInvalidPriceIds: true,
+    //     }
+    //   );
+    //   priceUpdates.parsed?.forEach((priceUpdate) => {
+    //     this.latestPriceInfo.set(priceUpdate.id, {
+    //       price: priceUpdate.price.price,
+    //       conf: priceUpdate.price.conf,
+    //       publishTime: priceUpdate.price.publish_time,
+    //     });
+    //   });
+    // } catch (error: any) {
+    //   // Always log the HTTP error first
+    //   this.logger.error("Failed to get latest price feeds:", error);
+    // }
 
     // Store health check interval reference
     this.healthCheckInterval = setInterval(() => {
@@ -146,29 +139,6 @@ export class PythPriceListener implements IPriceListener {
         throw new Error("Hermes Price feeds are not updating.");
       }
     }, 5000);
-  }
-
-  private onNewPriceFeed(priceFeed: PriceFeed) {
-    this.logger.debug(
-      `Received new price feed update from Pyth price service: ${this.priceIdToAlias.get(
-        priceFeed.id
-      )} ${priceFeed.id}`
-    );
-
-    // Consider price to be currently available if it is not older than 60s
-    const currentPrice = priceFeed.getPriceNoOlderThan(60);
-    if (currentPrice === undefined) {
-      return;
-    }
-
-    const priceInfo: PriceInfo = {
-      conf: currentPrice.conf,
-      price: currentPrice.price,
-      publishTime: currentPrice.publishTime,
-    };
-
-    this.latestPriceInfo.set(priceFeed.id, priceInfo);
-    this.lastUpdated = Date.now() as TimestampInMs;
   }
 
   getLatestPriceInfo(priceId: string): PriceInfo | undefined {
